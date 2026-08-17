@@ -2645,6 +2645,11 @@ pub fn wide_string(s: &str) -> Vec<u16> {
 // This only changes mstsc's top-level window title. The full-screen connection
 // bar is rendered separately and cannot be customized when mstsc.exe is
 // launched as an independent process.
+// Bidi controls and zero-width joiners: `char::is_control` covers only Cc.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
 pub fn set_rdp_window_title<F>(mut child: std::process::Child, name_of: F)
 where
     F: Fn() -> String + Send + 'static,
@@ -2670,9 +2675,11 @@ where
                     Ok(None) => {
                         // Asked every turn: the peer's hostname arrives with the login
                         // reply, seconds after mstsc opened its window.
+                        // Format characters too, not just Cc: the hostname comes from the
+                        // peer, and U+202E would reorder the caption it is written into.
                         let name: String = name_of()
                             .chars()
-                            .filter(|c| !c.is_control())
+                            .filter(|c| !c.is_control() && !is_format_char(*c))
                             .take(120)
                             .collect();
                         if !name.is_empty() {
@@ -2737,13 +2744,32 @@ fn set_process_rdp_window_title(process_id: DWORD, name: &str, title: &[u16]) ->
         if len <= 0 {
             return TRUE;
         }
-        // Against the target, not "localhost": a peer named after it would otherwise
-        // be rewritten on every turn, repainting the caption twice a second forever.
-        if String::from_utf16_lossy(&current[..len as usize]) == context.name {
+        let current = String::from_utf16_lossy(&current[..len as usize]);
+        // Already ours: comparing against the target rather than just looking for
+        // "localhost" is what stops a peer named after it being rewritten forever.
+        if current == context.name {
             context.titled = true;
             return TRUE;
         }
-        if SetWindowTextW(hwnd, context.title.as_ptr()) == FALSE {
+        // Still require the tunnel address. mstsc shows the Windows Security prompt
+        // before any session frame exists -- unowned, visible, same process -- and
+        // putting peer-supplied text on a credential dialog is worse than no rename.
+        if !current.contains("localhost") {
+            return TRUE;
+        }
+        // Timed out, not SetWindowTextW: that is a blocking SendMessage, and an mstsc
+        // stalled on a reconnect would wedge this thread for the rest of the session.
+        let mut sent = 0;
+        if SendMessageTimeoutW(
+            hwnd,
+            WM_SETTEXT,
+            0,
+            context.title.as_ptr() as LPARAM,
+            SMTO_ABORTIFHUNG,
+            1000,
+            &mut sent,
+        ) == 0
+        {
             // Keep going: a window closing mid-pass must not hide the rest.
             context.error = Some(io::Error::last_os_error());
         } else {
@@ -2759,15 +2785,13 @@ fn set_process_rdp_window_title(process_id: DWORD, name: &str, title: &[u16]) ->
         titled: false,
         error: None,
     };
-    let enumerated =
-        unsafe { EnumWindows(Some(enum_window), &mut context as *mut Context as LPARAM) };
-    if let Some(err) = context.error {
-        return Err(err);
+    unsafe { EnumWindows(Some(enum_window), &mut context as *mut Context as LPARAM) };
+    // A failure on some other window does not undo the frame's rename; reporting it
+    // would leave the caller polling fast forever on a title that is already correct.
+    match context.error {
+        Some(err) if !context.titled => Err(err),
+        _ => Ok(context.titled),
     }
-    if enumerated == FALSE {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(context.titled)
 }
 
 /// send message to currently shown window
