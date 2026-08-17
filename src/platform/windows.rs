@@ -2645,11 +2645,10 @@ pub fn wide_string(s: &str) -> Vec<u16> {
 // This only changes mstsc's top-level window title. The full-screen connection
 // bar is rendered separately and cannot be customized when mstsc.exe is
 // launched as an independent process.
-pub fn set_rdp_window_title(mut child: std::process::Child, name: String) {
-    let name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
-    if name.is_empty() {
-        return;
-    }
+pub fn set_rdp_window_title<F>(mut child: std::process::Child, name_of: F)
+where
+    F: Fn() -> String + Send + 'static,
+{
     let process_id = child.id();
     // mstsc owns the title and can restore "localhost" while connecting or
     // reconnecting. Follow only the process we launched and reapply the peer
@@ -2658,6 +2657,9 @@ pub fn set_rdp_window_title(mut child: std::process::Child, name: String) {
         .name("rdp-window-title".to_owned())
         .spawn(move || {
             let mut warned = false;
+            let mut renamed = false;
+            let mut current_name = String::new();
+            let mut title: Vec<u16> = Vec::new();
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
@@ -2665,16 +2667,38 @@ pub fn set_rdp_window_title(mut child: std::process::Child, name: String) {
                         log::warn!("Failed to query mstsc process: {}", err);
                         break;
                     }
-                    Ok(None) => match set_process_rdp_window_title(process_id, &name) {
-                        Ok(()) => warned = false,
-                        Err(err) if !warned => {
-                            log::warn!("Failed to set RDP window title: {}", err);
-                            warned = true;
+                    Ok(None) => {
+                        // Asked every turn: the peer's hostname arrives with the login
+                        // reply, seconds after mstsc opened its window.
+                        let name: String = name_of()
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(120)
+                            .collect();
+                        if !name.is_empty() {
+                            if name != current_name {
+                                title = wide_string(&name);
+                                current_name = name;
+                                renamed = false;
+                            }
+                            match set_process_rdp_window_title(process_id, &current_name, &title) {
+                                Ok(done) => {
+                                    renamed |= done;
+                                    warned = false;
+                                }
+                                Err(err) if !warned => {
+                                    log::warn!("Failed to set RDP window title: {}", err);
+                                    warned = true;
+                                }
+                                Err(_) => {}
+                            }
                         }
-                        Err(_) => {}
-                    },
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                // Poll fast until the title sticks; mstsc only restores "localhost"
+                // around a (re)connect, so watching for that is not urgent.
+                let wait = if renamed { 2000 } else { 500 };
+                std::thread::sleep(Duration::from_millis(wait));
             }
         })
     {
@@ -2682,10 +2706,13 @@ pub fn set_rdp_window_title(mut child: std::process::Child, name: String) {
     }
 }
 
-fn set_process_rdp_window_title(process_id: DWORD, name: &str) -> io::Result<()> {
-    struct Context {
+// Ok(true) once a window carries the name, so the caller can slow its polling down.
+fn set_process_rdp_window_title(process_id: DWORD, name: &str, title: &[u16]) -> io::Result<bool> {
+    struct Context<'a> {
         process_id: DWORD,
-        title: Vec<u16>,
+        name: &'a str,
+        title: &'a [u16],
+        titled: bool,
         error: Option<io::Error>,
     }
 
@@ -2693,27 +2720,43 @@ fn set_process_rdp_window_title(process_id: DWORD, name: &str) -> io::Result<()>
         let context = &mut *(lparam as *mut Context);
         let mut window_process_id = 0;
         GetWindowThreadProcessId(hwnd, &mut window_process_id);
-        if window_process_id != context.process_id || IsWindowVisible(hwnd) == FALSE {
+        // Unowned frames only: mstsc's error and certificate dialogs share the process
+        // and can carry the server string, and renaming one hides what it is.
+        if window_process_id != context.process_id
+            || IsWindowVisible(hwnd) == FALSE
+            || !GetWindow(hwnd, GW_OWNER).is_null()
+        {
             return TRUE;
         }
         let len = GetWindowTextLengthW(hwnd);
         if len <= 0 {
             return TRUE;
         }
-        let mut title = vec![0u16; len as usize + 1];
-        let len = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as _);
-        if len > 0 && String::from_utf16_lossy(&title[..len as usize]).contains("localhost") {
-            if SetWindowTextW(hwnd, context.title.as_ptr()) == FALSE {
-                context.error = Some(io::Error::last_os_error());
-                return FALSE;
-            }
+        let mut current = vec![0u16; len as usize + 1];
+        let len = GetWindowTextW(hwnd, current.as_mut_ptr(), current.len() as _);
+        if len <= 0 {
+            return TRUE;
+        }
+        // Against the target, not "localhost": a peer named after it would otherwise
+        // be rewritten on every turn, repainting the caption twice a second forever.
+        if String::from_utf16_lossy(&current[..len as usize]) == context.name {
+            context.titled = true;
+            return TRUE;
+        }
+        if SetWindowTextW(hwnd, context.title.as_ptr()) == FALSE {
+            // Keep going: a window closing mid-pass must not hide the rest.
+            context.error = Some(io::Error::last_os_error());
+        } else {
+            context.titled = true;
         }
         TRUE
     }
 
     let mut context = Context {
         process_id,
-        title: wide_string(name),
+        name,
+        title,
+        titled: false,
         error: None,
     };
     let enumerated =
@@ -2724,7 +2767,7 @@ fn set_process_rdp_window_title(process_id: DWORD, name: &str) -> io::Result<()>
     if enumerated == FALSE {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(context.titled)
 }
 
 /// send message to currently shown window
