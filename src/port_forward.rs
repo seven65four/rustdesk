@@ -16,18 +16,14 @@ use hbb_common::{
 };
 
 fn run_rdp(port: u16, lc: &Arc<RwLock<LoginConfigHandler>>, id: &str) {
-    // Per tunnel, not one shared `localhost` entry: a second session deletes and
-    // overwrites the first one's credential, and the first one's reconnect then
-    // authenticates with the wrong account.
-    let target = format!("localhost:{}", port);
     std::process::Command::new("cmdkey")
-        .arg(format!("/delete:{}", target))
+        .arg("/delete:localhost")
         .output()
         .ok();
     let username = std::env::var("rdp_username").unwrap_or_default();
     let password = std::env::var("rdp_password").unwrap_or_default();
     if !username.is_empty() || !password.is_empty() {
-        let mut args = vec![format!("/generic:{}", target)];
+        let mut args = vec!["/generic:localhost".to_owned()];
         if !username.is_empty() {
             args.push(format!("/user:{}", username));
         }
@@ -42,7 +38,7 @@ fn run_rdp(port: u16, lc: &Arc<RwLock<LoginConfigHandler>>, id: &str) {
     // Keep using /v instead of a generated .rdp file: mstsc then preserves the
     // user's Default.rdp settings and avoids unsigned-file warnings or policies.
     match std::process::Command::new("mstsc")
-        .arg(format!("/v:{}", target))
+        .arg(format!("/v:localhost:{}", port))
         .spawn()
     {
         Ok(child) => {
